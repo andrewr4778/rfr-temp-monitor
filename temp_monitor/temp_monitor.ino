@@ -1,4 +1,5 @@
-// RFR temp monitor - Nano + analog mux, reports over I2C
+// RFR temp monitor - Nano + CD74HC4067 mux, 16 diode temp sensors, reports over I2C
+// sensors: 10k pullup to 5V + diode to gnd, diode voltage DROPS ~2mV per degC
 // reg map:
 //   0x00 status  (bit0 = fault, bit1 = sensor error, bit2 = still booting)
 //   0x01 fault map high, 0x02 fault map low
@@ -10,16 +11,16 @@
 #include <Wire.h>
 #include <avr/wdt.h>
 
-#define PHYSICAL_CD4051BE   // comment this out for the 16 ch version (CD4067)
+// #define PHYSICAL_CD4051BE   // only uncomment this for the old 8 ch CD4051 board
 
 #ifdef PHYSICAL_CD4051BE
   const uint8_t NUM_CH        = 8;
   const uint8_t MUX_SEL_BITS  = 3;
-  const uint16_t SETTLE_US    = 100;
+  const uint16_t SETTLE_US    = 500;
 #else
   const uint8_t NUM_CH        = 16;
   const uint8_t MUX_SEL_BITS  = 4;
-  const uint16_t SETTLE_US    = 50;
+  const uint16_t SETTLE_US    = 500;   // 1k + 100nF filter is ~100us, wait ~5x that
 #endif
 
 const int16_t TEMP_UNUSED = 0x7FFF;
@@ -27,9 +28,9 @@ const int16_t TEMP_BAD    = 0x7FFE;
 
 const uint8_t I2C_ADDR   = 0x40;
 const uint8_t MUX_S[4]   = {2, 3, 4, 5};
-const uint8_t MUX_EN_N   = 6;
-const uint8_t LED_FAULT  = 7;
-const uint8_t FAULT_N    = 8;   // needs external pullup, we only ever pull it low
+// mux enable pin is tied to gnd on the board so we dont use it
+const uint8_t LED_FAULT  = 9;   // matches schematic (R20 + red LED on D9)
+const uint8_t FAULT_N    = 8;   // not wired in the schematic yet, needs external pullup, we only pull it low
 const uint8_t ADC_PIN    = A0;
 
 const int16_t  FAULT_SET_X10 = 600;   // 60.0C trips
@@ -42,6 +43,12 @@ const uint8_t  N_AVG         = 8;
 // internal ref is NOT exactly 1.1V (datasheet says 1.0 - 1.2V)
 // TODO: measure AREF with a multimeter on each board and put the real number here
 const uint32_t VREF_MV = 1100;
+
+// diode sensor: temp (C x10) = 250 + (VF25 - mV) * 5   (2mV per degC, 1mV = 0.5C = 5 in x10)
+// TODO: measure each diode at a known temp (room temp ~25C) and put its voltage in here,
+//       diodes vary a lot from part to part
+const int16_t VF25_MV[16] = {600, 600, 600, 600, 600, 600, 600, 600,
+                             600, 600, 600, 600, 600, 600, 600, 600};
 
 const uint8_t REG_STATUS = 0x00;
 const uint8_t REG_FMAP_H = 0x01;
@@ -75,8 +82,9 @@ int16_t readTempX10(uint8_t ch, uint16_t &adcOut) {
   uint16_t adc = sum / N_AVG;
   adcOut = adc;
 
-  // 10mV/degC sensor so mV reading = degC x10
-  return (int16_t)((adc * VREF_MV) / 1024UL);
+  // adc -> mV, then diode voltage -> temp (lower voltage = hotter)
+  int16_t mv = (int16_t)((adc * VREF_MV) / 1024UL);
+  return 250 + (VF25_MV[ch] - mv) * 5;
 }
 
 void updateChannelState(uint8_t ch, int16_t tX10, uint16_t adc) {
@@ -155,8 +163,6 @@ void setup() {
     digitalWrite(MUX_S[i], LOW);
   }
 
-  pinMode(MUX_EN_N, OUTPUT);
-  digitalWrite(MUX_EN_N, LOW);
   pinMode(LED_FAULT, OUTPUT);
 
   // start out in fault/booting state
